@@ -1,0 +1,23 @@
+# Data
+data/raw/
+data/processed/
+data/interim/
+
+# MLflow
+mlruns/
+
+# Environment
+.env
+.venv/
+
+# Claude
+CLAUDE.local.md
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# macOS
+.DS_Store

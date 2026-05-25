@@ -1,0 +1,87 @@
+# Model configuration for Credit Risk: Loan Default Predictor
+
+data:
+  processed_path: data/processed/loans_cleaned.parquet
+  target_column: default
+  test_size: 0.2
+  val_size: 0.1
+  random_state: 42
+
+features:
+  numeric:
+    - loan_amnt
+    - int_rate
+    - installment
+    - annual_inc
+    - dti
+    - fico_range_low
+    - fico_range_high
+    - revol_bal
+    - revol_util
+    - open_acc
+    - pub_rec
+    - delinq_2yrs
+    - total_acc
+    - inq_last_6mths
+    - cr_history_months
+    - loan_age_months
+    - emp_length
+    - term
+  categorical:
+    - grade
+    - sub_grade
+    - home_ownership
+    - verification_status
+    - purpose
+    - application_type
+    - initial_list_status
+    - disbursement_method
+    - addr_state
+
+training:
+  experiment_name: loan-default-predictor
+  mlflow_tracking_uri: mlruns
+
+models:
+  logistic_regression:
+    C: 1.0
+    max_iter: 1000
+    class_weight: balanced
+    solver: lbfgs
+
+  random_forest:
+    n_estimators: 300
+    max_depth: 10
+    min_samples_leaf: 50
+    class_weight: balanced
+    n_jobs: -1
+    random_state: 42
+
+  xgboost:
+    n_estimators: 500
+    max_depth: 6
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    scale_pos_weight: 4       # ~(1 - default_rate) / default_rate
+    eval_metric: auc
+    random_state: 42
+
+  lightgbm:
+    n_estimators: 500
+    max_depth: 6
+    learning_rate: 0.05
+    num_leaves: 63
+    subsample: 0.8
+    colsample_bytree: 0.8
+    class_weight: balanced
+    random_state: 42
+
+evaluation:
+  primary_metric: roc_auc
+  secondary_metrics:
+    - average_precision
+    - f1
+    - precision
+    - recall
+  threshold: 0.5            # classification threshold (tune on val set)
