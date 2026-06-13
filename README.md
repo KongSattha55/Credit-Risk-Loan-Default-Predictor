@@ -15,7 +15,6 @@ Given loan application attributes available **at origination** (borrower profile
 ```
 ├── api/                    FastAPI inference service
 ├── app/                    Frontend/dashboard app
-├── claude/                 Claude Code slash commands and rules
 ├── configs/                Model hyperparameters and feature configs
 ├── data/
 │   ├── raw/                Original source data (not committed)
