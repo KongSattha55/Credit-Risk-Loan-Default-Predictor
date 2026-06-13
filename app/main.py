@@ -10,6 +10,7 @@ Tabs:
 """
 
 import json
+import pickle
 import sys
 from pathlib import Path
 
@@ -24,14 +25,20 @@ PROJECT_ROOT  = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))   # allow `from src.xxx import`
 
 ARTIFACTS_DIR = PROJECT_ROOT / "mlruns" / "artifacts"
-MODEL_PATH    = ARTIFACTS_DIR / "lightgbm_tuned.txt"
-META_PATH     = ARTIFACTS_DIR / "tuning_metadata.json"
+CALIBRATED_MODEL_PATH = PROJECT_ROOT / "models" / "lightgbm_calibrated_sigmoid.pkl"
+RAW_MODEL_PATH = ARTIFACTS_DIR / "lightgbm_model.pkl"
+META_PATH     = ARTIFACTS_DIR / "lightgbm_metadata.json"
 
 INTERIM_PATH  = PROJECT_ROOT / "data" / "interim"   / "loans_features.parquet"
 CLEANED_PATH  = PROJECT_ROOT / "data" / "processed"  / "loans_cleaned.parquet"
 MAPS_PATH     = ARTIFACTS_DIR / "encoding_maps.json"
 
+from src.explain_utils import summarize_shap_local
+from src.calibration_classes import LGBMBoosterWrapper, PreFitCalibratedClassifier  # noqa: F401
+from src.business_risk import assign_risk_band, calculate_expected_loss, threshold_business_table
 from src.inference_fe import ALWAYS_DROP as _ALWAYS_DROP_T, TARGET as _TARGET
+from src.leakage import feature_columns as leakage_free_feature_columns, leakage_columns_present
+from src.splits import time_split_masks
 
 RANDOM_STATE = 42
 TARGET       = _TARGET
@@ -43,9 +50,15 @@ ALWAYS_DROP  = list(_ALWAYS_DROP_T)
 # ══════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource
-def load_lgb_model():
-    import lightgbm as lgb
-    return lgb.Booster(model_file=str(MODEL_PATH))
+def load_calibrated_model():
+    with open(CALIBRATED_MODEL_PATH, "rb") as f:
+        return pickle.load(f)
+
+
+@st.cache_resource
+def load_raw_lgb_model():
+    with open(RAW_MODEL_PATH, "rb") as f:
+        return pickle.load(f)
 
 
 @st.cache_resource
@@ -53,12 +66,16 @@ def load_shap_explainer():
     """TreeExplainer is the right choice for LightGBM boosters — O(TD²L)
     per row, no background sample needed."""
     import shap
-    return shap.TreeExplainer(load_lgb_model())
+    return shap.TreeExplainer(load_raw_lgb_model())
 
 
 @st.cache_data
 def load_metadata() -> dict:
-    return json.loads(META_PATH.read_text())
+    meta = json.loads(META_PATH.read_text())
+    leaks = leakage_columns_present(meta.get("feature_columns", []))
+    if leaks:
+        raise RuntimeError(f"Metadata contains leakage features and cannot be served: {leaks}")
+    return meta
 
 
 @st.cache_data
@@ -67,50 +84,37 @@ def load_encoding_maps() -> dict:
 
 
 @st.cache_data(show_spinner="Loading data and computing predictions …")
-def load_test_predictions() -> tuple[np.ndarray, np.ndarray]:
+def load_test_predictions() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Reconstruct the identical 20% test split (same random_state as training)
-    and return (y_true, y_proba).  Results are cached so the tab loads fast.
+    Reconstruct the 2017+ time-based test split used by training and return
+    (y_true, y_proba). Results are cached so the tab loads fast.
     """
-    from sklearn.model_selection import train_test_split
-
     if INTERIM_PATH.exists():
         df = pd.read_parquet(INTERIM_PATH)
     elif CLEANED_PATH.exists():
         df = pd.read_parquet(CLEANED_PATH)
     else:
-        return None, None
+        return None, None, None
 
-    issue_d      = df["issue_d"] if "issue_d" in df.columns else None
-    drop_cols    = [c for c in (ALWAYS_DROP + ["issue_d"]) if c in df.columns]
-    feature_cols = [c for c in df.columns if c not in drop_cols + [TARGET]]
-
-    X = df[feature_cols].copy()
-    y = df[TARGET].astype("int32")
-
-    for col in X.select_dtypes(include=["object"]).columns:
-        X[col] = X[col].astype("category")
-
-    strategy = load_metadata().get("split_strategy", "random")
-    if strategy == "chronological" and issue_d is not None:
-        order = np.argsort(issue_d.values)
-        n = len(X)
-        n_test = int(n * 0.20)
-        test_idx = order[n - n_test :]
-        X_test, y_test = X.iloc[test_idx], y.iloc[test_idx]
-    else:
-        _, X_test, _, y_test = train_test_split(
-            X, y, test_size=0.20, stratify=y, random_state=RANDOM_STATE
-        )
+    if "issue_d" not in df.columns:
+        return None, None, None
 
     meta     = load_metadata()
     features = meta["feature_columns"]
-    X_test   = X_test[[c for c in features if c in X_test.columns]]
+    available_features = leakage_free_feature_columns(df.columns, extra_drop=["issue_d"])
+    missing = [c for c in features if c not in available_features]
+    if missing:
+        return None, None, None
 
-    model   = load_lgb_model()
-    y_proba = model.predict(X_test, num_iteration=meta.get("best_iteration", 0) or 0)
+    _, _, test_mask = time_split_masks(df["issue_d"])
+    X_test = df.loc[test_mask, features].copy()
+    y_test = df.loc[test_mask, TARGET].astype("int32")
+    loan_amounts = df.loc[test_mask, "loan_amnt"].astype("float32")
 
-    return y_test.values, y_proba
+    model   = load_calibrated_model()
+    y_proba = model.predict_proba(X_test)[:, 1]
+
+    return y_test.values, y_proba, loan_amounts.values
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -121,12 +125,24 @@ from src.inference_fe import apply_feature_engineering, risk_label
 
 
 def predict_single(inputs: dict, feature_columns: list[str]) -> float:
-    model = load_lgb_model()
+    model = load_calibrated_model()
     maps  = load_encoding_maps()
     eng   = apply_feature_engineering(inputs, maps)
     row   = {col: [eng.get(col, 0.0)] for col in feature_columns}
     df    = pd.DataFrame(row).astype("float32")
-    return float(model.predict(df)[0])
+    return float(model.predict_proba(df)[0, 1])
+
+
+def positive_class_shap_values(raw_values) -> np.ndarray:
+    if isinstance(raw_values, list):
+        raw_values = raw_values[1] if len(raw_values) > 1 else raw_values[0]
+    values = np.asarray(raw_values)
+    if values.ndim == 3:
+        if values.shape[-1] == 2:
+            values = values[:, :, 1]
+        elif values.shape[0] == 2:
+            values = values[1]
+    return values
 
 
 def metrics_at_threshold(y_true: np.ndarray, y_proba: np.ndarray, thresh: float) -> dict:
@@ -153,8 +169,12 @@ st.set_page_config(
 
 st.title("💳 Credit Risk — Loan Default Predictor")
 
-if not MODEL_PATH.exists():
-    st.error("Model not found. Run `python src/tune_lightgbm.py` first.")
+if not CALIBRATED_MODEL_PATH.exists():
+    st.error("Calibrated model not found. Run `python src/calibrate.py` first.")
+    st.stop()
+
+if not RAW_MODEL_PATH.exists():
+    st.error("Raw LightGBM model not found. Run `python src/train.py --model lightgbm` first.")
     st.stop()
 
 meta      = load_metadata()
@@ -167,10 +187,16 @@ with st.sidebar:
     st.metric("Test Avg Precision", f"{meta['test_avg_precision']:.4f}")
     st.metric("Test F1",            f"{meta['test_f1']:.4f}")
     st.metric("Saved Threshold",    f"{saved_thr:.4f}")
+    st.caption("PD model: calibrated sigmoid")
     st.caption(f"Data: {meta.get('data_source', '—')}")
     st.caption(f"Run ID: {meta['mlflow_run_id'][:8]}…")
 
-tab_predict, tab_threshold, tab_batch = st.tabs(["Predict", "Threshold Analysis", "Batch Score (CSV)"])
+tab_predict, tab_threshold, tab_business, tab_batch = st.tabs([
+    "Predict",
+    "Threshold Analysis",
+    "Business Risk Analytics",
+    "Batch Score (CSV)",
+])
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -191,7 +217,7 @@ with tab_predict:
             "addr_state": "CA", "dti": 8.0, "fico_range_low": 780,
             "delinq_2yrs": 0, "inq_last_6mths": 0, "open_acc": 6, "pub_rec": 0,
             "revol_bal": 1500, "revol_util": 8.0, "total_acc": 22,
-            "loan_age_months": 24, "cr_history_months": 240, "mort_acc": 1,
+            "cr_history_months": 240, "mort_acc": 1,
         },
         "Borderline (C-grade, medium DTI)": {
             "loan_amnt": 15000, "term": 36, "int_rate": 13.0, "installment": 505.0,
@@ -201,7 +227,7 @@ with tab_predict:
             "addr_state": "TX", "dti": 22.0, "fico_range_low": 680,
             "delinq_2yrs": 0, "inq_last_6mths": 1, "open_acc": 9, "pub_rec": 0,
             "revol_bal": 8000, "revol_util": 45.0, "total_acc": 18,
-            "loan_age_months": 12, "cr_history_months": 120, "mort_acc": 0,
+            "cr_history_months": 120, "mort_acc": 0,
         },
         "Risky (F-grade, high DTI)": {
             "loan_amnt": 30000, "term": 60, "int_rate": 26.0, "installment": 895.0,
@@ -211,7 +237,7 @@ with tab_predict:
             "addr_state": "NV", "dti": 38.0, "fico_range_low": 620,
             "delinq_2yrs": 1, "inq_last_6mths": 4, "open_acc": 12, "pub_rec": 1,
             "revol_bal": 14000, "revol_util": 88.0, "total_acc": 15,
-            "loan_age_months": 6, "cr_history_months": 80, "mort_acc": 0,
+            "cr_history_months": 80, "mort_acc": 0,
         },
     }
 
@@ -283,7 +309,6 @@ with tab_predict:
     with st.expander("Advanced / Bureau Fields (optional)", expanded=False):
         ac1, ac2 = st.columns(2)
         with ac1:
-            loan_age_months   = st.number_input("Loan Age (months)", 0, 200, int(_ss("loan_age_months", 24)), key="fld_loan_age_months")
             cr_history_months = st.number_input("Credit History (months)", 0, 1200, int(_ss("cr_history_months", 120)), key="fld_cr_history_months")
             mort_acc          = st.number_input("Mortgage Accounts", 0, 50, int(_ss("mort_acc", 0)), key="fld_mort_acc")
             tot_cur_bal       = st.number_input("Total Current Balance ($)", 0, 5_000_000, int(_ss("tot_cur_bal", 20000)), 1000, key="fld_tot_cur_bal")
@@ -306,7 +331,7 @@ with tab_predict:
         "revol_bal": revol_bal, "revol_util": revol_util, "total_acc": total_acc,
         "initial_list_status": "w", "application_type": "Individual",
         "disbursement_method": "Cash",
-        "loan_age_months": loan_age_months, "cr_history_months": cr_history_months,
+        "cr_history_months": cr_history_months,
         "mort_acc": mort_acc, "tot_cur_bal": tot_cur_bal, "avg_cur_bal": avg_cur_bal,
         "bc_util": bc_util, "pct_tl_nvr_dlq": pct_tl_nvr_dlq,
         "acc_open_past_24mths": acc_open_past_24mths,
@@ -338,30 +363,10 @@ with tab_predict:
             f"Predicted: {'Default (1)' if pred else 'Fully Paid (0)'}"
         )
 
-        # Key drivers
-        drivers = []
-        if int_rate > 20:          drivers.append(f"High interest rate ({int_rate:.1f}%)")
-        if dti > 35:               drivers.append(f"High DTI ({dti:.1f}%)")
-        if fico_range_low < 650:   drivers.append(f"Low FICO ({fico_range_low:.0f})")
-        if revol_util > 75:        drivers.append(f"High revolving utilisation ({revol_util:.0f}%)")
-        if term == 60:             drivers.append("60-month term (higher default rate)")
-        if grade in ("E","F","G"): drivers.append(f"Low credit grade ({grade})")
-        if not drivers:
-            drivers = ["No major red flags detected."]
-
-        st.markdown("**Key risk drivers (heuristic):**")
-        for d in drivers:
-            st.markdown(f"- {d}")
-
-        # ── SHAP explanation ────────────────────────────────────────────────
+        # ── Individual model explanation ────────────────────────────────────
         st.divider()
-        st.markdown("**Model explanation — SHAP contributions**")
-        st.caption(
-            "Each bar shows how much that feature pushed the raw model score "
-            "above (+) or below (−) the baseline. Positive = toward default."
-        )
+        st.markdown("**Model explanation**")
         try:
-            import shap
             maps  = load_encoding_maps()
             eng   = apply_feature_engineering(inputs, maps)
             row   = pd.DataFrame(
@@ -369,15 +374,32 @@ with tab_predict:
             ).astype("float32")
 
             explainer  = load_shap_explainer()
-            sv         = explainer(row)
-            shap_vals  = sv.values[0]
-            base_val   = float(sv.base_values[0]) if hasattr(sv, "base_values") else 0.0
+            shap_vals  = positive_class_shap_values(explainer.shap_values(row))[0]
             feat_vals  = row.iloc[0].values
+            summary    = summarize_shap_local(shap_vals, feat_vals, features, top_n=5)
+
+            c_inc, c_dec = st.columns(2)
+            with c_inc:
+                st.markdown("**Factors increasing risk**")
+                if summary["top_positive_drivers"]:
+                    for driver in summary["top_positive_drivers"]:
+                        st.markdown(f"- {driver['explanation']}")
+                else:
+                    st.caption("No strong risk-increasing factors found.")
+            with c_dec:
+                st.markdown("**Factors reducing risk**")
+                if summary["top_negative_drivers"]:
+                    for driver in summary["top_negative_drivers"]:
+                        st.markdown(f"- {driver['explanation']}")
+                else:
+                    st.caption("No strong risk-reducing factors found.")
+
+            st.markdown("**Plain-English explanation**")
+            st.text(summary["explanation_text"])
 
             top_n = 10
             order = np.argsort(np.abs(shap_vals))[::-1][:top_n]
 
-            import plotly.graph_objects as go
             top_feats = [features[i] for i in order][::-1]
             top_shap  = [float(shap_vals[i]) for i in order][::-1]
             top_raw   = [float(feat_vals[i]) for i in order][::-1]
@@ -393,13 +415,14 @@ with tab_predict:
             shap_fig.update_layout(
                 height=360,
                 margin=dict(l=10, r=10, t=20, b=10),
-                xaxis_title=f"SHAP value (base score = {base_val:+.3f})",
+                title="Main factors for this prediction",
+                xaxis_title="Risk impact",
                 yaxis_title="",
                 showlegend=False,
             )
             st.plotly_chart(shap_fig, use_container_width=True)
         except Exception as exc:
-            st.warning(f"SHAP explanation unavailable: {exc}")
+            st.warning(f"Model explanation unavailable: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -415,7 +438,7 @@ with tab_threshold:
     )
 
     # ── Load test-set predictions ──────────────────────────────────────────
-    y_true, y_proba = load_test_predictions()
+    y_true, y_proba, _loan_amounts = load_test_predictions()
 
     if y_true is None:
         st.warning("No data found to compute curves. Run src/data_cleaning.py first.")
@@ -691,7 +714,137 @@ with tab_threshold:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# TAB 3 — Batch CSV scoring
+# TAB 3 — Business Risk Analytics
+# ══════════════════════════════════════════════════════════════════════════
+
+with tab_business:
+    st.subheader("Business Risk Analytics")
+    st.markdown(
+        "Analyze approval/rejection trade-offs using calibrated probabilities, "
+        "loan amount as exposure at default, and the selected loss-given-default assumption."
+    )
+
+    y_true_b, y_proba_b, loan_amounts_b = load_test_predictions()
+
+    if y_true_b is None:
+        st.warning("No data found to compute business analytics. Run src/data_cleaning.py first.")
+        st.stop()
+
+    bc1, bc2 = st.columns([2, 1])
+    with bc1:
+        business_threshold = st.slider(
+            "Approval threshold",
+            min_value=0.01,
+            max_value=0.99,
+            value=float(saved_thr),
+            step=0.005,
+            format="%.3f",
+            help="Approve loans with calibrated PD below this threshold.",
+        )
+    with bc2:
+        lgd = st.number_input(
+            "Loss Given Default",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.45,
+            step=0.05,
+            format="%.2f",
+        )
+
+    business_table = threshold_business_table(
+        y_true_b,
+        y_proba_b,
+        loan_amounts_b,
+        lgd=lgd,
+        thresholds=np.array([business_threshold]),
+    )
+    selected = business_table.iloc[0]
+    approved = y_proba_b < business_threshold
+    rejected = ~approved
+    expected_loss = calculate_expected_loss(y_proba_b, lgd=lgd, ead=loan_amounts_b)
+
+    st.markdown(f"#### Portfolio View at threshold **{business_threshold:.3f}**")
+    br1, br2, br3, br4, br5 = st.columns(5)
+    br1.metric("Approval Rate", f"{selected['approval_rate']:.1%}")
+    br2.metric("Rejected Rate", f"{selected['rejection_rate']:.1%}")
+    br3.metric("Default Rate Approved", f"{selected['default_rate_approved']:.1%}")
+    br4.metric("Defaults Caught", f"{selected['defaults_caught_rate']:.1%}")
+    br5.metric("Expected Loss", f"${selected['expected_loss_approved']:,.0f}")
+
+    el1, el2, el3 = st.columns(3)
+    el1.metric("Approved Expected Loss", f"${selected['expected_loss_approved']:,.0f}")
+    el2.metric("Rejected Expected Loss", f"${selected['expected_loss_rejected']:,.0f}")
+    el3.metric("Total Expected Loss", f"${selected['total_expected_loss']:,.0f}")
+
+    st.caption(
+        "Expected Loss = calibrated PD x LGD x loan amount. "
+        "Rejected expected loss is risk avoided or routed to review under the selected threshold."
+    )
+
+    risk_bands = assign_risk_band(y_proba_b)
+    band_order = ["Low", "Medium", "High", "Very High"]
+    band_df = (
+        pd.DataFrame(
+            {
+                "risk_band": risk_bands,
+                "loan_amount": loan_amounts_b,
+                "expected_loss": expected_loss,
+            }
+        )
+        .groupby("risk_band", observed=False)
+        .agg(loans=("risk_band", "size"), exposure=("loan_amount", "sum"), expected_loss=("expected_loss", "sum"))
+        .reindex(band_order, fill_value=0)
+        .reset_index()
+    )
+
+    st.markdown("#### Risk-Band Distribution")
+    band_fig = go.Figure()
+    band_fig.add_trace(
+        go.Bar(
+            x=band_df["risk_band"],
+            y=band_df["loans"],
+            marker=dict(color=["#2E7D32", "#F9A825", "#EF6C00", "#C62828"]),
+            text=[f"{v:,}" for v in band_df["loans"]],
+            textposition="outside",
+        )
+    )
+    band_fig.update_layout(
+        height=340,
+        margin=dict(l=10, r=10, t=30, b=10),
+        xaxis_title="Risk Band",
+        yaxis_title="Loan Count",
+        showlegend=False,
+    )
+    st.plotly_chart(band_fig, use_container_width=True)
+
+    st.markdown("#### Threshold Business Table")
+    scenario_thresholds = np.round(np.arange(0.05, 0.501, 0.025), 3)
+    scenario_table = threshold_business_table(
+        y_true_b,
+        y_proba_b,
+        loan_amounts_b,
+        lgd=lgd,
+        thresholds=scenario_thresholds,
+    )
+    st.dataframe(
+        scenario_table.style.format(
+            {
+                "threshold": "{:.3f}",
+                "approval_rate": "{:.1%}",
+                "rejection_rate": "{:.1%}",
+                "default_rate_approved": "{:.1%}",
+                "defaults_caught_rate": "{:.1%}",
+                "expected_loss_approved": "${:,.0f}",
+                "expected_loss_rejected": "${:,.0f}",
+                "total_expected_loss": "${:,.0f}",
+            }
+        ),
+        use_container_width=True,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 4 — Batch CSV scoring
 # ══════════════════════════════════════════════════════════════════════════
 
 with tab_batch:
@@ -739,7 +892,7 @@ with tab_batch:
                     for row in df_in.to_dict(orient="records")
                 ]
                 X_batch = pd.DataFrame(engineered).astype("float32")
-                probs   = load_lgb_model().predict(X_batch)
+                probs   = load_calibrated_model().predict_proba(X_batch)[:, 1]
 
                 out = df_in.copy()
                 out["default_probability"] = probs

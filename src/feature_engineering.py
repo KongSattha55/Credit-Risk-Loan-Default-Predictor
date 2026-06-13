@@ -25,15 +25,20 @@ from __future__ import annotations
 import warnings
 warnings.filterwarnings("ignore")
 
+import sys
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE    = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE))
 DATA_IN = BASE / "data" / "processed" / "loans_cleaned.parquet"
 DATA_OUT= BASE / "data" / "interim"   / "loans_features.parquet"
 DATA_OUT.parent.mkdir(parents=True, exist_ok=True)
+
+from src.leakage import LEAKAGE_COLS  # noqa: E402
+from src.splits import SPLIT_STRATEGY, time_split_masks  # noqa: E402
 
 TARGET = "default"
 
@@ -382,12 +387,16 @@ def _drop_redundant(df: pd.DataFrame) -> pd.DataFrame:
     Remove:
       • Collinear duplicates (funded_amnt ≈ loan_amnt, fico_range_high ≈ fico_range_low)
       • Raw string columns that have been replaced by numeric encodings
+      • Any leakage columns that should never reach the model (safety net)
     Log-transformed columns: originals are KEPT so the model / regularisation
     can select between raw and log scales.
     """
-    all_drops = [
-        c for c in COLLINEAR_DROPS + RAW_CAT_DROPS if c in df.columns
-    ]
+    explicit = COLLINEAR_DROPS + RAW_CAT_DROPS
+    # Leakage columns must never reach feature engineering output.  This guard
+    # catches any column from LEAKAGE_COLS that was accidentally left in the
+    # data (e.g. loan_age_months created by an older version of data_cleaning.py).
+    leakage_present = [c for c in LEAKAGE_COLS if c in df.columns]
+    all_drops = list(set(c for c in explicit + leakage_present if c in df.columns))
     return df.drop(columns=all_drops)
 
 
@@ -426,6 +435,13 @@ def _validate(df: pd.DataFrame) -> None:
     # Target unchanged — values must be drawn from {0, 1} (subset OK for small fixtures)
     assert set(df[TARGET].unique()).issubset({0, 1}), \
         f"Target column contains values outside {{0, 1}}: {sorted(df[TARGET].unique())}"
+
+    # No leakage columns may survive into the output
+    surviving_leakage = [c for c in LEAKAGE_COLS if c in df.columns]
+    assert not surviving_leakage, (
+        f"Leakage columns present in feature-engineering output: {surviving_leakage}. "
+        "These must be removed before this data is used for training."
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -506,10 +522,7 @@ def engineer_features(
 
 def build_train_mask(
     df: pd.DataFrame,
-    strategy: str = "random",
-    test_size: float = 0.20,
-    val_size: float = 0.10,
-    random_state: int = 42,
+    strategy: str = SPLIT_STRATEGY,
 ) -> np.ndarray:
     """
     Build a boolean mask marking TRAIN rows (True) vs val+test rows (False).
@@ -517,33 +530,15 @@ def build_train_mask(
     encodings learned here are used on the correct train subset at training.
 
     strategy:
-      "random"        — stratified random (default, matches existing tune script)
-      "chronological" — first (1 - test_size - val_size) by issue_d → train
+      "time_based_issue_d" — issue_d < 2016-01-01
     """
-    n = len(df)
-
-    if strategy == "chronological":
+    if strategy == SPLIT_STRATEGY:
         if "issue_d" not in df.columns:
-            raise ValueError("chronological split requires issue_d column from data_cleaning")
-        order = df["issue_d"].argsort().to_numpy()
-        n_train = int(n * (1.0 - test_size - val_size))
-        mask = np.zeros(n, dtype=bool)
-        mask[order[:n_train]] = True
-        return mask
+            raise ValueError("time-based split requires issue_d column from data_cleaning")
+        train_mask, _, _ = time_split_masks(df["issue_d"])
+        return train_mask.to_numpy()
 
-    # Random stratified (matches tune_lightgbm.py: 70/10/20)
-    from sklearn.model_selection import train_test_split
-    y = df[TARGET]
-    idx = np.arange(n)
-    idx_temp, _ = train_test_split(idx, test_size=test_size, stratify=y, random_state=random_state)
-    y_temp = y.iloc[idx_temp]
-    val_frac = val_size / (1.0 - test_size)
-    idx_train, _ = train_test_split(
-        idx_temp, test_size=val_frac, stratify=y_temp, random_state=random_state
-    )
-    mask = np.zeros(n, dtype=bool)
-    mask[idx_train] = True
-    return mask
+    raise ValueError(f"Unknown split strategy: {strategy!r}")
 
 
 def main() -> None:
@@ -560,9 +555,9 @@ def main() -> None:
     print()
 
     # Build train mask so target encodings are leakage-free.
-    # Strategy matches the default used by tune_lightgbm.py (random, seed=42).
+    # Default strategy matches downstream model training: train on loans before 2016.
     import os
-    split_strategy = os.environ.get("SPLIT_STRATEGY", "random")
+    split_strategy = os.environ.get("SPLIT_STRATEGY", SPLIT_STRATEGY)
     print(f"Building train mask (strategy={split_strategy}) …")
     train_mask = build_train_mask(df, strategy=split_strategy)
     print(f"  Train rows: {train_mask.sum():,}  /  Held-out: {(~train_mask).sum():,}")

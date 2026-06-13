@@ -12,16 +12,8 @@ from __future__ import annotations
 
 import numpy as np
 
-# Columns dropped from features before model training / scoring. Shared across
-# train / tune / threshold / explain / app to avoid drift.
-TARGET = "default"
-ALWAYS_DROP = (
-    TARGET,
-    "funded_amnt",
-    "funded_amnt_inv",
-    "fico_range_high",
-    "emp_title",
-)
+from src.business_risk import assign_risk_band
+from src.leakage import ALWAYS_DROP, LEAKAGE_COLS, TARGET
 
 # Log1p columns must stay in sync with src/feature_engineering.LOG_TRANSFORM_COLS.
 _LOG_COLS = (
@@ -102,7 +94,5 @@ def apply_feature_engineering(raw: dict, maps: dict) -> dict:
 
 
 def risk_label(prob: float) -> str:
-    if prob < 0.15:  return "Low"
-    if prob < 0.30:  return "Medium"
-    if prob < 0.50:  return "High"
-    return "Very High"
+    """Return the canonical business risk band for a single probability."""
+    return assign_risk_band(prob)

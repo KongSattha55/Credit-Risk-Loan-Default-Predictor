@@ -60,7 +60,8 @@ def _make_df(**overrides) -> pd.DataFrame:
         "initial_list_status": ["w"],
         "application_type":    ["Individual"],
         "disbursement_method": ["Cash"],
-        "loan_age_months":     [24.0],
+        # loan_age_months is in LEAKAGE_COLS and must not appear in feature
+        # engineering input; data_cleaning.py no longer creates it.
         "cr_history_months":   [120.0],
         # Skewed / bureau
         "tot_coll_amt":    [0.0],

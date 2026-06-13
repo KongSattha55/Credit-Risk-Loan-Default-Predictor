@@ -40,7 +40,6 @@ from sklearn.metrics import (
     f1_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -54,12 +53,17 @@ ARTIFACTS_DIR = PROJECT_ROOT / "mlruns" / "artifacts"
 # ── Constants ─────────────────────────────────────────────────────────────
 import sys as _sys
 _sys.path.insert(0, str(PROJECT_ROOT))
-from src.inference_fe import ALWAYS_DROP as _ALWAYS_DROP_T, TARGET as _TARGET  # noqa: E402
+from src.leakage import TARGET as _TARGET, feature_columns  # noqa: E402
+from src.splits import (  # noqa: E402
+    SPLIT_STRATEGY,
+    ensure_issue_datetime,
+    print_split_summary,
+    split_xy_by_issue_date,
+)
 
 TARGET       = _TARGET
 RANDOM_STATE = 42
 EXPERIMENT   = "loan-default-lightgbm"
-ALWAYS_DROP  = list(_ALWAYS_DROP_T)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -81,11 +85,15 @@ def load_data() -> tuple[pd.DataFrame, pd.Series, pd.Series | None, str]:
             "Run data_cleaning.py first."
         )
 
-    # issue_d is kept as a datetime by the updated data_cleaning for chronological splits.
+    # issue_d is kept as a datetime for the fixed time-based split.
     # It's not a feature — it must not land in X.
-    issue_d = df["issue_d"] if "issue_d" in df.columns else None
-    drop_cols = [c for c in (ALWAYS_DROP + ["issue_d"]) if c in df.columns]
-    feature_cols = [c for c in df.columns if c not in drop_cols + [TARGET]]
+    if "issue_d" not in df.columns:
+        raise ValueError(
+            "Time-based split requires issue_d. Re-run src/data_cleaning.py "
+            "and src/feature_engineering.py so issue_d is preserved."
+        )
+    issue_d = ensure_issue_datetime(df["issue_d"])
+    feature_cols = feature_columns(df.columns, extra_drop=["issue_d"])
 
     X = df[feature_cols].copy()
     y = df[TARGET].astype("int32")
@@ -100,41 +108,11 @@ def load_data() -> tuple[pd.DataFrame, pd.Series, pd.Series | None, str]:
 def make_splits(
     X: pd.DataFrame,
     y: pd.Series,
-    issue_d: pd.Series | None = None,
-    strategy: str = "random",
+    issue_d: pd.Series,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
            pd.Series,     pd.Series,     pd.Series]:
-    """
-    70 / 10 / 20 split.
-
-    strategy:
-      "random"        — stratified random (default, back-compat)
-      "chronological" — earliest 70% by issue_d → train, middle 10% → val, last 20% → test.
-                         Better reflects real-world deployment (train on past, score on future).
-    """
-    if strategy == "chronological":
-        if issue_d is None:
-            raise ValueError("chronological split requires issue_d series")
-        order = np.argsort(issue_d.values)
-        n = len(X)
-        n_test  = int(n * 0.20)
-        n_val   = int(n * 0.10)
-        train_idx = order[: n - n_test - n_val]
-        val_idx   = order[n - n_test - n_val : n - n_test]
-        test_idx  = order[n - n_test :]
-        return (
-            X.iloc[train_idx], X.iloc[val_idx], X.iloc[test_idx],
-            y.iloc[train_idx], y.iloc[val_idx], y.iloc[test_idx],
-        )
-
-    # Random stratified
-    X_temp, X_test, y_temp, y_test = train_test_split(
-        X, y, test_size=0.20, stratify=y, random_state=RANDOM_STATE
-    )
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=0.125, stratify=y_temp, random_state=RANDOM_STATE
-    )
-    return X_train, X_val, X_test, y_train, y_val, y_test
+    """Split data into fixed origination-date windows."""
+    return split_xy_by_issue_date(X, y, issue_d)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -258,7 +236,7 @@ def train_final_model(
     cat_cols: list[str],
     data_source: str,
     mlflow_run_id_study: str,
-    split_strategy: str = "random",
+    split_strategy: str = SPLIT_STRATEGY,
 ) -> None:
     """Retrain on train+val using best params; evaluate on test set; log to MLflow."""
 
@@ -395,6 +373,7 @@ def train_final_model(
         all_strategies,
         roc_auc=test_auc,
         pr_auc=test_ap,
+        ks_stat=test_refiner.ks_stat,
         current_threshold=best_thresh,
         current_metrics=current_metrics,
         n_test=len(y_test),
@@ -409,10 +388,10 @@ def train_final_model(
 # 6.  Main
 # ══════════════════════════════════════════════════════════════════════════
 
-def main(n_trials: int = 50, timeout: int | None = None, split_strategy: str = "random") -> None:
+def main(n_trials: int = 50, timeout: int | None = None) -> None:
     print("=" * 60)
     print("  LightGBM Hyperparameter Tuning — Optuna")
-    print(f"  Trials: {n_trials}  |  Timeout: {timeout or 'none'}s  |  Split: {split_strategy}")
+    print(f"  Trials: {n_trials}  |  Timeout: {timeout or 'none'}s  |  Split: {SPLIT_STRATEGY}")
     print("=" * 60)
 
     # ── Load data ─────────────────────────────────────────────────────────
@@ -422,18 +401,10 @@ def main(n_trials: int = 50, timeout: int | None = None, split_strategy: str = "
     print(f"      Shape : {X.shape[0]:,} rows × {X.shape[1]} features")
     print(f"      Default rate: {y.mean()*100:.2f}%")
 
-    if split_strategy == "chronological" and issue_d is None:
-        raise ValueError(
-            "Chronological split requested but issue_d missing. "
-            "Re-run data_cleaning.py (updated version preserves issue_d)."
-        )
-
     # ── Split ─────────────────────────────────────────────────────────────
     print("\n[2/5] Splitting data …")
-    X_train, X_val, X_test, y_train, y_val, y_test = make_splits(
-        X, y, issue_d=issue_d, strategy=split_strategy,
-    )
-    print(f"      Train : {len(X_train):>9,}  |  Val : {len(X_val):>7,}  |  Test : {len(X_test):>8,}")
+    X_train, X_val, X_test, y_train, y_val, y_test = make_splits(X, y, issue_d=issue_d)
+    print_split_summary(issue_d, y)
 
     neg  = (y_train == 0).sum()
     pos  = (y_train == 1).sum()
@@ -507,7 +478,7 @@ def main(n_trials: int = 50, timeout: int | None = None, split_strategy: str = "
         cat_cols        = cat_cols,
         data_source     = data_source,
         mlflow_run_id_study = study_run_id,
-        split_strategy  = split_strategy,
+        split_strategy  = SPLIT_STRATEGY,
     )
 
 
@@ -517,7 +488,5 @@ if __name__ == "__main__":
                         help="Number of Optuna trials (default: 50)")
     parser.add_argument("--timeout",  type=int, default=None,
                         help="Max seconds for tuning (optional wall-clock cap)")
-    parser.add_argument("--split", choices=["random", "chronological"], default="random",
-                        help="Split strategy (chronological = train on past, test on future)")
     args = parser.parse_args()
-    main(n_trials=args.n_trials, timeout=args.timeout, split_strategy=args.split)
+    main(n_trials=args.n_trials, timeout=args.timeout)

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -39,11 +40,11 @@ from sklearn.metrics import (
     f1_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
 # ── Paths ─────────────────────────────────────────────────────────────────
 PROJECT_ROOT  = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 CONFIG_PATH   = PROJECT_ROOT / "configs" / "model.yaml"
 INTERIM_PATH  = PROJECT_ROOT / "data" / "interim" / "loans_features.parquet"
 CLEANED_PATH  = PROJECT_ROOT / "data" / "processed" / "loans_cleaned.parquet"
@@ -51,17 +52,15 @@ MLFLOW_URI    = str(PROJECT_ROOT / "mlruns")
 ARTIFACTS_DIR = PROJECT_ROOT / "mlruns" / "artifacts"
 
 # ── Constants ──────────────────────────────────────────────────────────────
-TARGET       = "default"
-RANDOM_STATE = 42
+from src.leakage import TARGET, feature_columns  # noqa: E402
+from src.splits import (  # noqa: E402
+    SPLIT_STRATEGY,
+    ensure_issue_datetime,
+    print_split_summary,
+    split_xy_by_issue_date,
+)
 
-# Columns to drop before training (leaky, redundant, high-cardinality string)
-ALWAYS_DROP = [
-    TARGET,
-    "funded_amnt",
-    "funded_amnt_inv",
-    "fico_range_high",
-    "emp_title",
-]
+RANDOM_STATE = 42
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -77,7 +76,7 @@ def load_config() -> dict:
 # Data
 # ══════════════════════════════════════════════════════════════════════════
 
-def load_data() -> tuple[pd.DataFrame, pd.Series, str]:
+def load_data() -> tuple[pd.DataFrame, pd.Series, pd.Series, str]:
     if INTERIM_PATH.exists():
         df = pd.read_parquet(INTERIM_PATH)
         source = "interim (feature-engineered)"
@@ -90,20 +89,26 @@ def load_data() -> tuple[pd.DataFrame, pd.Series, str]:
             "then optionally src/feature_engineering.py."
         )
 
-    drop_cols  = [c for c in ALWAYS_DROP if c in df.columns]
-    feature_cols = [c for c in df.columns if c not in drop_cols + [TARGET]]
+    if "issue_d" not in df.columns:
+        raise ValueError(
+            "Time-based split requires issue_d. Re-run src/data_cleaning.py "
+            "and src/feature_engineering.py so issue_d is preserved."
+        )
+
+    issue_d = ensure_issue_datetime(df["issue_d"])
+    feature_cols = feature_columns(df.columns, extra_drop=["issue_d"])
 
     X = df[feature_cols].copy()
     y = df[TARGET].astype("int32")
 
-    return X, y, source
+    return X, y, issue_d, source
 
 
 def encode_categoricals(X_train: pd.DataFrame,
                          X_val: pd.DataFrame,
                          X_test: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Label-encode object/string columns. Fit on train only."""
-    cat_cols = X_train.select_dtypes(include=["object", "str", "category"]).columns.tolist()
+    cat_cols = X_train.select_dtypes(include=["object", "category"]).columns.tolist()
     encoders = {}
     for col in cat_cols:
         le = LabelEncoder()
@@ -119,21 +124,8 @@ def encode_categoricals(X_train: pd.DataFrame,
     return X_train, X_val, X_test
 
 
-def make_splits(X: pd.DataFrame, y: pd.Series, cfg: dict):
-    test_size = cfg["data"]["test_size"]
-    val_size  = cfg["data"]["val_size"]
-    rs        = cfg["data"]["random_state"]
-
-    # val_frac is fraction of the temp (non-test) set
-    val_frac = val_size / (1.0 - test_size)
-
-    X_temp, X_test, y_temp, y_test = train_test_split(
-        X, y, test_size=test_size, stratify=y, random_state=rs
-    )
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=val_frac, stratify=y_temp, random_state=rs
-    )
-    return X_train, X_val, X_test, y_train, y_val, y_test
+def make_splits(X: pd.DataFrame, y: pd.Series, issue_d: pd.Series):
+    return split_xy_by_issue_date(X, y, issue_d)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -189,15 +181,15 @@ def train_and_evaluate(model_name: str, cfg: dict) -> None:
 
     # ── Load data ─────────────────────────────────────────────────────────
     print("[1/4] Loading data …")
-    X, y, source = load_data()
+    X, y, issue_d, source = load_data()
     print(f"      Source: {source}")
     print(f"      Shape : {X.shape[0]:,} rows × {X.shape[1]} features")
     print(f"      Default rate: {y.mean()*100:.2f}%")
 
     # ── Split ─────────────────────────────────────────────────────────────
     print("[2/4] Splitting data …")
-    X_train, X_val, X_test, y_train, y_val, y_test = make_splits(X, y, cfg)
-    print(f"      Train: {len(X_train):,} | Val: {len(X_val):,} | Test: {len(X_test):,}")
+    X_train, X_val, X_test, y_train, y_val, y_test = make_splits(X, y, issue_d)
+    print_split_summary(issue_d, y)
 
     # Encode categoricals (sklearn models need numeric input)
     X_train, X_val, X_test = encode_categoricals(X_train, X_val, X_test)
@@ -245,6 +237,7 @@ def train_and_evaluate(model_name: str, cfg: dict) -> None:
             "model_name":      model_name,
             "threshold":       round(best_thresh, 4),
             "data_source":     source,
+            "split_strategy":  SPLIT_STRATEGY,
             "n_train":         len(X_train),
             "n_val":           len(X_val),
             "n_test":          len(X_test),
@@ -278,6 +271,7 @@ def train_and_evaluate(model_name: str, cfg: dict) -> None:
         "threshold":       round(best_thresh, 4),
         "feature_columns": X_train.columns.tolist(),
         "data_source":     source,
+        "split_strategy":  SPLIT_STRATEGY,
         "val_roc_auc":     round(val_auc,    6),
         "val_avg_precision": round(val_ap,   6),
         "test_roc_auc":    round(test_auc,   6),

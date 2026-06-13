@@ -1,0 +1,31 @@
+feature,mean_abs_shap,rank,direction_note,business_interpretation
+sub_grade_enc,0.23773216433390384,1,Higher values tend to increase predicted default risk.,Weaker LendingClub sub-grades indicate higher borrower risk.
+int_rate_x_term,0.19335898852439545,2,Higher values tend to increase predicted default risk.,High interest rates combined with longer terms can indicate repayment uncertainty.
+acc_open_past_24mths,0.12622892417010187,3,Higher values tend to increase predicted default risk.,Many recently opened accounts can indicate fast credit growth and higher risk.
+term_60,0.1130801915749827,4,Higher values tend to increase predicted default risk.,Longer 60-month loans have a longer repayment horizon and usually increase uncertainty.
+fico_dti_score,0.09838986788391604,5,Higher values tend to reduce predicted default risk.,A stronger credit score relative to debt burden usually lowers default risk.
+int_rate,0.08938491508151165,6,Higher values tend to reduce predicted default risk.,Higher interest rates usually indicate riskier borrowers and increase predicted default risk.
+home_ownership_enc,0.08259445008906281,7,Higher values tend to reduce predicted default risk.,Home ownership status can proxy borrower stability and housing obligations.
+loan_to_income,0.08157407068334761,8,Higher values tend to increase predicted default risk.,A larger loan relative to income can make repayment harder.
+state_default_rate,0.07993623787884392,9,Higher values tend to increase predicted default risk.,Borrower geography can capture regional economic or portfolio risk patterns.
+grade_enc,0.0784797702809288,10,Higher values tend to increase predicted default risk.,Weaker LendingClub grades indicate higher borrower risk.
+fico_range_low,0.07209484506499017,11,Higher values tend to reduce predicted default risk.,Higher FICO scores indicate stronger credit quality and usually lower predicted default risk.
+emp_title_log_freq,0.05743003729791476,12,Higher values tend to increase predicted default risk.,Employment-title patterns can capture occupation stability in the historical portfolio.
+mo_sin_old_rev_tl_op,0.04583127232418522,13,Higher values tend to reduce predicted default risk.,mo sin old rev tl op is an important model signal; review its SHAP direction and distribution.
+avg_cur_bal,0.045468229089258516,14,Higher values tend to reduce predicted default risk.,avg cur bal is an important model signal; review its SHAP direction and distribution.
+total_bc_limit,0.0436319956300122,15,Higher values tend to reduce predicted default risk.,Higher bankcard limits can indicate available liquidity and established credit access.
+loan_amnt,0.04360710013350399,16,Higher values tend to increase predicted default risk.,loan amnt is an important model signal; review its SHAP direction and distribution.
+mths_since_recent_bc,0.04210019768915091,17,Higher values tend to reduce predicted default risk.,mths since recent bc is an important model signal; review its SHAP direction and distribution.
+percent_bc_gt_75,0.03993198355295163,18,Higher values tend to increase predicted default risk.,percent bc gt 75 is an important model signal; review its SHAP direction and distribution.
+delinq_2yrs,0.039122767763360516,19,Higher values tend to increase predicted default risk.,delinq 2yrs is an important model signal; review its SHAP direction and distribution.
+num_rev_tl_bal_gt_0,0.039037489772827144,20,Higher values tend to increase predicted default risk.,num rev tl bal gt 0 is an important model signal; review its SHAP direction and distribution.
+mths_since_recent_inq,0.037859409130987835,21,Higher values tend to reduce predicted default risk.,mths since recent inq is an important model signal; review its SHAP direction and distribution.
+max_bal_bc,0.03472533991142832,22,Higher values tend to increase predicted default risk.,max bal bc is an important model signal; review its SHAP direction and distribution.
+mort_acc,0.034718617431653206,23,Higher values tend to reduce predicted default risk.,Mortgage account count is an important model signal; review its SHAP direction and distribution.
+annual_inc,0.03462689864577553,24,Higher values tend to reduce predicted default risk.,Higher income can improve repayment capacity and reduce default risk.
+mo_sin_rcnt_rev_tl_op,0.03099590256360982,25,Higher values tend to increase predicted default risk.,More time since a recent revolving account was opened can indicate less recent credit expansion.
+num_il_tl,0.029594265726743934,26,Higher values tend to reduce predicted default risk.,num il tl is an important model signal; review its SHAP direction and distribution.
+installment_to_income,0.02772672041869175,27,Higher values tend to increase predicted default risk.,A higher monthly payment burden can increase default risk.
+mo_sin_rcnt_tl,0.026582127556248236,28,Higher values tend to reduce predicted default risk.,mo sin rcnt tl is an important model signal; review its SHAP direction and distribution.
+cr_history_months,0.026280203601916484,29,Higher values tend to increase predicted default risk.,Longer credit history can indicate more established borrower behavior.
+revol_util,0.026206053483186525,30,Higher values tend to increase predicted default risk.,Higher revolving utilization can indicate credit stress.

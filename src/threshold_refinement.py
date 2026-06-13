@@ -3,8 +3,8 @@ src/threshold_refinement.py
 ───────────────────────────
 Precision / Recall threshold analysis for the LightGBM loan-default model.
 
-Reconstructs the deterministic test split (random_state=42, 70/10/20),
-runs predictions, then evaluates five threshold strategies:
+Reconstructs the deterministic time-based test split (`issue_d >= 2017-01-01`),
+runs predictions, then evaluates threshold strategies:
 
   1. max_f1          — maximise F1  (current default)
   2. max_precision   — highest precision s.t. recall ≥ --min-recall
@@ -41,7 +41,6 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import train_test_split
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 PROJECT_ROOT  = Path(__file__).resolve().parents[1]
@@ -53,11 +52,10 @@ META_PATH     = ARTIFACTS_DIR / "tuning_metadata.json"
 
 import sys as _sys
 _sys.path.insert(0, str(PROJECT_ROOT))
-from src.inference_fe import ALWAYS_DROP as _ALWAYS_DROP_T, TARGET as _TARGET  # noqa: E402
+from src.leakage import TARGET as _TARGET, feature_columns  # noqa: E402
+from src.splits import ensure_issue_datetime, time_split_masks  # noqa: E402
 
 TARGET       = _TARGET
-RANDOM_STATE = 42
-ALWAYS_DROP  = list(_ALWAYS_DROP_T)
 
 STRATEGIES = ("max_f1", "max_precision", "max_recall", "youden", "cost_sensitive", "max_ks")
 
@@ -75,9 +73,10 @@ def _load_data() -> tuple[pd.DataFrame, pd.Series, pd.Series | None]:
     else:
         raise FileNotFoundError("Run src/data_cleaning.py first.")
 
-    issue_d = df["issue_d"] if "issue_d" in df.columns else None
-    drop_cols    = [c for c in (ALWAYS_DROP + ["issue_d"]) if c in df.columns]
-    feature_cols = [c for c in df.columns if c not in drop_cols + [TARGET]]
+    if "issue_d" not in df.columns:
+        raise ValueError("Time-based threshold split requires issue_d. Re-run data cleaning and feature engineering.")
+    issue_d = ensure_issue_datetime(df["issue_d"])
+    feature_cols = feature_columns(df.columns, extra_drop=["issue_d"])
 
     X = df[feature_cols].copy()
     y = df[TARGET].astype("int32")
@@ -91,49 +90,21 @@ def _load_data() -> tuple[pd.DataFrame, pd.Series, pd.Series | None]:
 def _test_split(
     X: pd.DataFrame,
     y: pd.Series,
-    issue_d: pd.Series | None = None,
-    strategy: str = "random",
+    issue_d: pd.Series,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Return the identical 20 % test set used during training."""
-    if strategy == "chronological":
-        if issue_d is None:
-            raise ValueError("chronological split requires issue_d in the data")
-        order = np.argsort(issue_d.values)
-        n = len(X)
-        n_test = int(n * 0.20)
-        test_idx = order[n - n_test :]
-        return X.iloc[test_idx], y.iloc[test_idx]
-
-    _, X_test, _, y_test = train_test_split(
-        X, y, test_size=0.20, stratify=y, random_state=RANDOM_STATE
-    )
-    return X_test, y_test
+    """Return the identical test set used during training."""
+    _, _, test_mask = time_split_masks(issue_d)
+    return X.loc[test_mask], y.loc[test_mask]
 
 
 def _val_split(
     X: pd.DataFrame,
     y: pd.Series,
-    issue_d: pd.Series | None = None,
-    strategy: str = "random",
+    issue_d: pd.Series,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Return the identical 10 % val set used during training."""
-    if strategy == "chronological":
-        if issue_d is None:
-            raise ValueError("chronological split requires issue_d in the data")
-        order = np.argsort(issue_d.values)
-        n = len(X)
-        n_test = int(n * 0.20)
-        n_val  = int(n * 0.10)
-        val_idx = order[n - n_test - n_val : n - n_test]
-        return X.iloc[val_idx], y.iloc[val_idx]
-
-    X_temp, _, y_temp, _ = train_test_split(
-        X, y, test_size=0.20, stratify=y, random_state=RANDOM_STATE
-    )
-    _, X_val, _, y_val = train_test_split(
-        X_temp, y_temp, test_size=0.125, stratify=y_temp, random_state=RANDOM_STATE
-    )
-    return X_val, y_val
+    """Return the identical validation set used during training."""
+    _, val_mask, _ = time_split_masks(issue_d)
+    return X.loc[val_mask], y.loc[val_mask]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -498,9 +469,9 @@ def main() -> None:
     # ── Reconstruct test set ───────────────────────────────────────────────
     print("Reconstructing test split …")
     X, y, issue_d = _load_data()
-    strategy = meta.get("split_strategy", "random")
+    strategy = meta.get("split_strategy", "time_based_issue_d")
     print(f"  Split strategy (from metadata): {strategy}")
-    X_test, y_test = _test_split(X, y, issue_d=issue_d, strategy=strategy)
+    X_test, y_test = _test_split(X, y, issue_d=issue_d)
 
     # Align columns to what model expects
     X_test = X_test[features]

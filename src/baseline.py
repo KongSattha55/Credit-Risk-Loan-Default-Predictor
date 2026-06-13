@@ -49,7 +49,6 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -57,13 +56,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.inference_fe import TARGET  # noqa: E402
+from src.splits import SPLIT_STRATEGY, ensure_issue_datetime, split_xy_by_issue_date  # noqa: E402
 
 INTERIM_PATH = PROJECT_ROOT / "data" / "interim"   / "loans_features.parquet"
 CLEANED_PATH = PROJECT_ROOT / "data" / "processed" / "loans_cleaned.parquet"
 META_PATH    = PROJECT_ROOT / "mlruns" / "artifacts" / "tuning_metadata.json"
 OUT_PATH     = PROJECT_ROOT / "mlruns" / "artifacts" / "baseline_metrics.json"
 
-RANDOM_STATE = 42
 GRADE_MAP = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6, "G": 7}
 
 
@@ -85,7 +84,9 @@ def _load_frame() -> tuple[pd.DataFrame, pd.Series | None]:
     else:
         raise FileNotFoundError("Run data_cleaning.py (or feature_engineering.py) first.")
 
-    issue_d = df["issue_d"] if "issue_d" in df.columns else None
+    if "issue_d" not in df.columns:
+        raise ValueError("Time-based baseline split requires issue_d. Re-run data cleaning and feature engineering.")
+    issue_d = ensure_issue_datetime(df["issue_d"])
     if issue_d is not None:
         df = df.drop(columns=["issue_d"])
 
@@ -93,33 +94,11 @@ def _load_frame() -> tuple[pd.DataFrame, pd.Series | None]:
     return df, issue_d
 
 
-def _splits(df: pd.DataFrame, issue_d: pd.Series | None, strategy: str):
+def _splits(df: pd.DataFrame, issue_d: pd.Series):
     """Return (X_train, X_val, X_test, y_train, y_val, y_test)."""
     X = df[["fico_range_low", "grade_ord"]].astype("float32")
     y = df[TARGET].astype("int32")
-
-    if strategy == "chronological":
-        if issue_d is None:
-            raise ValueError("chronological split requires issue_d column.")
-        order = np.argsort(issue_d.loc[df.index].values)
-        n = len(X)
-        n_test = int(n * 0.20)
-        n_val  = int(n * 0.10)
-        train_idx = order[: n - n_test - n_val]
-        val_idx   = order[n - n_test - n_val : n - n_test]
-        test_idx  = order[n - n_test :]
-        return (
-            X.iloc[train_idx], X.iloc[val_idx], X.iloc[test_idx],
-            y.iloc[train_idx], y.iloc[val_idx], y.iloc[test_idx],
-        )
-
-    X_temp, X_test, y_temp, y_test = train_test_split(
-        X, y, test_size=0.20, stratify=y, random_state=RANDOM_STATE
-    )
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=0.125, stratify=y_temp, random_state=RANDOM_STATE
-    )
-    return X_train, X_val, X_test, y_train, y_val, y_test
+    return split_xy_by_issue_date(X, y, issue_d.loc[df.index])
 
 
 def _ks(y_true: np.ndarray, y_proba: np.ndarray) -> float:
@@ -142,7 +121,7 @@ def main() -> None:
     print("=" * 60)
 
     meta = json.loads(META_PATH.read_text()) if META_PATH.exists() else {}
-    strategy = meta.get("split_strategy", "random")
+    strategy = meta.get("split_strategy", SPLIT_STRATEGY)
     print(f"  Split strategy : {strategy}")
 
     print("\n[1/4] Loading data …")
@@ -150,7 +129,7 @@ def main() -> None:
     print(f"  Rows after NA drop : {len(df):,}")
 
     print("[2/4] Splitting …")
-    X_train, X_val, X_test, y_train, y_val, y_test = _splits(df, issue_d, strategy)
+    X_train, X_val, X_test, y_train, y_val, y_test = _splits(df, issue_d)
     print(f"  Train / Val / Test : {len(X_train):,} / {len(X_val):,} / {len(X_test):,}")
     print(f"  Default rate (train): {y_train.mean():.3%}")
 
@@ -160,7 +139,6 @@ def main() -> None:
         ("logreg", LogisticRegression(
             class_weight="balanced",
             max_iter=1000,
-            random_state=RANDOM_STATE,
         )),
     ])
     model.fit(X_train, y_train)

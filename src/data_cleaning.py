@@ -9,6 +9,11 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
+try:
+    from src.leakage import LEAKAGE_COLS
+except ModuleNotFoundError:  # Allows `python src/data_cleaning.py`.
+    from leakage import LEAKAGE_COLS
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE = Path(__file__).resolve().parents[1]
 RAW  = BASE / "data/raw/archive/accepted_2007_to_2018Q4.csv.gz"
@@ -64,13 +69,7 @@ HIGH_MISSING = [
 
 # 2b. Post-origination / data-leakage (known only after loan is issued)
 LEAKAGE = [
-    "out_prncp", "out_prncp_inv",
-    "total_pymnt", "total_pymnt_inv",
-    "total_rec_prncp", "total_rec_int", "total_rec_late_fee",
-    "recoveries", "collection_recovery_fee",
-    "last_pymnt_d", "last_pymnt_amnt",
-    "next_pymnt_d",          # already in HIGH_MISSING, harmless duplicate
-    "last_credit_pull_d",
+    *LEAKAGE_COLS,
     "last_fico_range_high", "last_fico_range_low",
 ]
 
@@ -127,7 +126,7 @@ def load_and_clean():
     print(f"  Default rate: {df['default'].mean():.3%}")
 
     # ── 4.2 Drop unwanted columns ─────────────────────────────────────────────
-    to_drop = [c for c in COLS_TO_DROP if c in df.columns]
+    to_drop = [c for c in COLS_TO_DROP if c in df.columns and c != "loan_status"]
     df = df.drop(columns=to_drop + ["loan_status"])
     print(f"  After dropping {len(to_drop)} columns: {df.shape}")
 
@@ -137,14 +136,11 @@ def load_and_clean():
     df["int_rate"]   = parse_pct(df["int_rate"])
     df["revol_util"] = parse_pct(df["revol_util"])
 
-    # Date features: issue_d → loan age in months; earliest_cr_line → cr_history_months
-    # issue_d is preserved as a datetime column for chronological splitting downstream.
+    # Date features: issue_d is preserved for time-based splitting only.
+    # It is explicitly excluded from model features downstream.
     reference_date = pd.Timestamp("2019-01-01")   # ~end of dataset
     if "issue_d" in df.columns:
         df["issue_d"] = pd.to_datetime(df["issue_d"], format="%b-%Y", errors="coerce")
-        df["loan_age_months"] = (
-            (reference_date - df["issue_d"]) / pd.Timedelta(days=30.44)
-        ).round().astype("Int64")
     if "earliest_cr_line" in df.columns:
         df["cr_history_months"] = months_since(df["earliest_cr_line"], reference_date)
         df = df.drop(columns=["earliest_cr_line"])
@@ -165,7 +161,7 @@ def load_and_clean():
 
     # ── 4.5 Missing value imputation ─────────────────────────────────────────
     num_cols = df.select_dtypes(include="number").columns.tolist()
-    cat_cols = df.select_dtypes(include=["object", "str"]).columns.tolist()
+    cat_cols = df.select_dtypes(include=["object"]).columns.tolist()
 
     # Numeric → median (issue_d left untouched — it's a datetime)
     medians = {col: df[col].median() for col in num_cols if df[col].isna().any()}

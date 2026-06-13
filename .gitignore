@@ -10,14 +10,20 @@ mlruns/
 .env
 .venv/
 
-# Claude
-CLAUDE.local.md
-.claude/
+# Local assistant configuration
+.*.local.md
+.*assistant*/
+.local-config/
 
 # Python
 __pycache__/
 *.pyc
 .pytest_cache/
+.coverage
+htmlcov/
 
 # macOS
 .DS_Store
+
+# Local interactive sessions
+.Rhistory

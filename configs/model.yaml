@@ -3,9 +3,9 @@
 data:
   processed_path: data/processed/loans_cleaned.parquet
   target_column: default
-  test_size: 0.2
-  val_size: 0.1
-  random_state: 42
+  split_date_column: issue_d
+  train_end: "2016-01-01"
+  validation_end: "2017-01-01"
 
 features:
   numeric:
@@ -24,7 +24,6 @@ features:
     - total_acc
     - inq_last_6mths
     - cr_history_months
-    - loan_age_months
     - emp_length
     - term
   categorical:

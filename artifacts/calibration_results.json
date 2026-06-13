@@ -1,0 +1,29 @@
+{
+  "split_strategy": "time_based_issue_d",
+  "val_period": "2016",
+  "test_period": "2017-2018",
+  "n_val": 297651,
+  "n_test": 240864,
+  "test_default_rate": 0.262671,
+  "best_method": "sigmoid",
+  "n_bins": 15,
+  "leakage_in_model": [],
+  "raw": {
+    "roc_auc": 0.701052,
+    "pr_auc": 0.435,
+    "brier": 0.182594,
+    "log_loss": 0.548032
+  },
+  "sigmoid": {
+    "roc_auc": 0.701052,
+    "pr_auc": 0.435,
+    "brier": 0.175399,
+    "log_loss": 0.526919
+  },
+  "isotonic": {
+    "roc_auc": 0.700976,
+    "pr_auc": 0.431415,
+    "brier": 0.175444,
+    "log_loss": 0.526891
+  }
+}

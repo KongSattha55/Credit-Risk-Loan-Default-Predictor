@@ -1,0 +1,7 @@
+model,roc_auc,pr_auc,average_precision,brier_score,log_loss,f1,threshold,training_time_seconds,n_train,n_test,feature_count,notes
+LightGBM,0.706106,0.442494,0.442494,0.210386,0.606193,0.494609,0.453216,3.725,200000,240864,98,trained in comparison workflow
+XGBoost,0.704391,0.441801,0.441801,0.177859,0.535,0.492217,0.187286,6.237,200000,240864,98,trained in comparison workflow
+Calibrated LightGBM sigmoid,0.701052,0.435,0.435,0.175399,0.526919,0.490993,0.241457,0.075,831051,240864,98,pretrained production calibrated sigmoid artifact; time is scoring/loading comparison time
+Random Forest,0.697311,0.430738,0.430738,0.211647,0.608582,0.488426,0.458141,3.903,200000,240864,98,trained in comparison workflow
+Logistic Regression,0.690643,0.415379,0.415379,0.216593,0.627836,0.481552,0.472915,0.984,200000,240864,98,trained in comparison workflow
+FICO/grade logistic baseline,0.669895,0.392886,0.392886,0.221947,0.635531,0.472395,0.46799,0.033,200000,240864,2,trained in comparison workflow

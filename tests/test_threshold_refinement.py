@@ -156,14 +156,14 @@ class TestCostSensitive:
 # ── compare_all ────────────────────────────────────────────────────────────
 
 class TestCompareAll:
-    def test_returns_five_results(self, refiner):
+    def test_returns_six_results(self, refiner):
         results = refiner.compare_all()
-        assert len(results) == 5
+        assert len(results) == 6
 
     def test_strategies_are_distinct(self, refiner):
         results  = refiner.compare_all()
         names    = [r["strategy"] for r in results]
-        assert len(set(names)) == 5
+        assert len(set(names)) == 6
 
     def test_all_thresholds_in_unit_interval(self, refiner):
         for r in refiner.compare_all():

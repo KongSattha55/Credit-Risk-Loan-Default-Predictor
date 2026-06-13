@@ -1,0 +1,73 @@
+{
+  "sample_index": 1694,
+  "actual_default": 1,
+  "predicted_pd": 0.94512730369142,
+  "risk_label": "Very High",
+  "base_value": 0.4476695868013044,
+  "raw_shap_base_value": -0.29074048648454914,
+  "top_positive_drivers": [
+    {
+      "feature": "int_rate_x_term",
+      "value": 1839.0,
+      "shap_value": 0.6138195413467091,
+      "explanation": "Interest rate and term combination is notable (1,839), which increases predicted default risk."
+    },
+    {
+      "feature": "sub_grade_enc",
+      "value": 29.0,
+      "shap_value": 0.4926602138030912,
+      "explanation": "LendingClub sub-grade is notable (29.0), which increases predicted default risk."
+    },
+    {
+      "feature": "term_60",
+      "value": 1.0,
+      "shap_value": 0.2953570472422014,
+      "explanation": "60-month loan term is 60 months (1), which increases predicted default risk."
+    },
+    {
+      "feature": "fico_dti_score",
+      "value": 22.380468368530273,
+      "shap_value": 0.23593055457569784,
+      "explanation": "Credit score compared with debt burden is weaker compared with debt burden (22.4), which increases predicted default risk."
+    },
+    {
+      "feature": "grade_enc",
+      "value": 6.0,
+      "shap_value": 0.19278297755989512,
+      "explanation": "LendingClub grade is notable (6), which increases predicted default risk."
+    }
+  ],
+  "top_negative_drivers": [
+    {
+      "feature": "total_bc_limit",
+      "value": 28700.0,
+      "shap_value": -0.03704690991350474,
+      "explanation": "Total bankcard credit limit is higher (28,700), which reduces predicted default risk."
+    },
+    {
+      "feature": "purpose_rate_enc",
+      "value": 0.15629325807094574,
+      "shap_value": -0.03504518389574209,
+      "explanation": "Loan purpose risk pattern is favorable (0.156), which reduces predicted default risk."
+    },
+    {
+      "feature": "total_il_high_credit_limit",
+      "value": 62290.0,
+      "shap_value": -0.030242723898676847,
+      "explanation": "Total installment credit limit is higher (62,290), which reduces predicted default risk."
+    },
+    {
+      "feature": "emp_title_log_freq",
+      "value": 0.00033806890132837,
+      "shap_value": -0.024014148553448935,
+      "explanation": "Employment-title stability signal is favorable (0.000338), which reduces predicted default risk."
+    },
+    {
+      "feature": "mo_sin_rcnt_rev_tl_op",
+      "value": 6.0,
+      "shap_value": -0.022377765238314074,
+      "explanation": "Months since recent revolving account opened is less recent (6), which reduces predicted default risk."
+    }
+  ],
+  "plain_english_explanation": "This loan is predicted as higher risk mainly because:\n1. Interest rate and term combination is notable (1,839), which increases predicted default risk.\n2. LendingClub sub-grade is notable (29.0), which increases predicted default risk.\n3. 60-month loan term is 60 months (1), which increases predicted default risk.\n4. Credit score compared with debt burden is weaker compared with debt burden (22.4), which increases predicted default risk.\n5. LendingClub grade is notable (6), which increases predicted default risk.\n\nRisk is partially reduced because:\n1. Total bankcard credit limit is higher (28,700), which reduces predicted default risk.\n2. Loan purpose risk pattern is favorable (0.156), which reduces predicted default risk.\n3. Total installment credit limit is higher (62,290), which reduces predicted default risk.\n4. Employment-title stability signal is favorable (0.000338), which reduces predicted default risk.\n5. Months since recent revolving account opened is less recent (6), which reduces predicted default risk."
+}

@@ -1,7 +1,7 @@
 """
 FastAPI inference service for the LendingClub Loan Default Predictor.
 
-Loads the LightGBM model trained by src/tune_lightgbm.py.
+Loads the calibrated sigmoid LightGBM model for production probability output.
 Applies feature engineering transforms at inference time using
 encoding maps saved by src/feature_engineering.py.
 
@@ -13,11 +13,12 @@ Run:
 from __future__ import annotations
 
 import json
+import pickle
 import sys
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
-import lightgbm as lgb
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -26,11 +27,13 @@ from pydantic import BaseModel, Field
 PROJECT_ROOT  = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))  # allow `from src.xxx import`
 ARTIFACTS_DIR = PROJECT_ROOT / "mlruns" / "artifacts"
-MODEL_PATH    = ARTIFACTS_DIR / "lightgbm_tuned.txt"
-META_PATH     = ARTIFACTS_DIR / "tuning_metadata.json"
+MODEL_PATH    = PROJECT_ROOT / "models" / "lightgbm_calibrated_sigmoid.pkl"
+META_PATH     = ARTIFACTS_DIR / "lightgbm_metadata.json"
 MAPS_PATH     = ARTIFACTS_DIR / "encoding_maps.json"
 
+from src.calibration_classes import LGBMBoosterWrapper, PreFitCalibratedClassifier  # noqa: F401
 from src.inference_fe import apply_feature_engineering, risk_label
+from src.leakage import leakage_columns_present
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -38,17 +41,22 @@ from src.inference_fe import apply_feature_engineering, risk_label
 # ══════════════════════════════════════════════════════════════════════════
 
 @lru_cache(maxsize=1)
-def load_model() -> lgb.Booster:
+def load_model():
     if not MODEL_PATH.exists():
-        raise RuntimeError(f"Model not found at {MODEL_PATH}. Run src/tune_lightgbm.py first.")
-    return lgb.Booster(model_file=str(MODEL_PATH))
+        raise RuntimeError(f"Calibrated model not found at {MODEL_PATH}. Run `python src/calibrate.py` first.")
+    with open(MODEL_PATH, "rb") as f:
+        return pickle.load(f)
 
 
 @lru_cache(maxsize=1)
 def load_metadata() -> dict:
     if not META_PATH.exists():
         raise RuntimeError(f"Metadata not found at {META_PATH}.")
-    return json.loads(META_PATH.read_text())
+    meta = json.loads(META_PATH.read_text())
+    leaks = leakage_columns_present(meta.get("feature_columns", []))
+    if leaks:
+        raise RuntimeError(f"Metadata contains leakage features and cannot be served: {leaks}")
+    return meta
 
 
 @lru_cache(maxsize=1)
@@ -69,13 +77,13 @@ class LoanApplication(BaseModel):
 
     # Core loan terms
     loan_amnt:   float = Field(..., gt=0,        description="Requested loan amount ($)")
-    term:        int   = Field(...,               description="Loan term in months (36 or 60)")
+    term:        Literal[36, 60] = Field(...,      description="Loan term in months (36 or 60)")
     int_rate:    float = Field(..., gt=0,         description="Interest rate (%)")
     installment: float = Field(..., gt=0,         description="Monthly payment ($)")
 
     # Borrower grade / sub-grade (strings — encoded internally)
-    grade:     str = Field(..., description="LendingClub grade (A–G)")
-    sub_grade: str = Field(..., description="LendingClub sub-grade (A1–G5)")
+    grade:     Literal["A", "B", "C", "D", "E", "F", "G"] = Field(..., description="LendingClub grade (A–G)")
+    sub_grade: str = Field(..., pattern=r"^[A-G][1-5]$", description="LendingClub sub-grade (A1–G5)")
 
     # Borrower profile
     emp_length:          float = Field(0.0,  ge=0, le=10, description="Employment length (years)")
@@ -101,7 +109,6 @@ class LoanApplication(BaseModel):
     initial_list_status: str   = Field("w",          description="w or f")
     application_type:    str   = Field("Individual",  description="Individual or Joint App")
     disbursement_method: str   = Field("Cash",        description="Cash or DirectPay")
-    loan_age_months:     float = Field(0.0, ge=0)
     cr_history_months:   float = Field(0.0, ge=0)
 
     # Optional bureau fields — default to 0
@@ -194,11 +201,16 @@ app = FastAPI(
 @app.get("/health")
 def health():
     """Health check — verifies model and encoding maps are loaded."""
-    meta = load_metadata()
-    load_encoding_maps()   # raises if missing
+    try:
+        meta = load_metadata()
+        load_model()           # raises if missing or unreadable
+        load_encoding_maps()   # raises if missing
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     return {
         "status":       "ok",
         "model_type":   meta.get("model_type"),
+        "probability_model": "calibrated_sigmoid",
         "test_roc_auc": meta.get("test_roc_auc"),
         "n_features":   len(meta.get("feature_columns", [])),
     }
@@ -216,6 +228,7 @@ def predict(application: LoanApplication):
     try:
         model    = load_model()
         meta     = load_metadata()
+        load_encoding_maps()
     except RuntimeError as exc:
         # Missing model / metadata / encoding maps — operator-visible, safe to surface.
         raise HTTPException(status_code=503, detail=str(exc))
@@ -225,7 +238,7 @@ def predict(application: LoanApplication):
 
     try:
         df   = _build_model_input(application, features)
-        prob = float(model.predict(df)[0])
+        prob = float(model.predict_proba(df)[0, 1])
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=f"Invalid input: {exc}")
 
@@ -242,9 +255,14 @@ def predict(application: LoanApplication):
 @app.get("/model-info")
 def model_info():
     """Return model metadata and performance metrics."""
-    meta = load_metadata()
+    try:
+        meta = load_metadata()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     return {
         "model_type":    meta.get("model_type"),
+        "probability_model": "calibrated_sigmoid",
+        "model_path":    str(MODEL_PATH.relative_to(PROJECT_ROOT)),
         "mlflow_run_id": meta.get("mlflow_run_id"),
         "threshold":     meta.get("threshold"),
         "n_features":    len(meta.get("feature_columns", [])),
